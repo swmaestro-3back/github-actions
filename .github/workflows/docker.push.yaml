@@ -1,0 +1,176 @@
+name: docker push
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: >
+          The type of machine to run the job on. 
+          Examples:
+          - ubuntu-latest
+          - '["self-hosted","linux","x64"]'
+        required: false
+        type: string
+        default: '"ubuntu-24.04-arm"'
+      aws_region:
+        description: "AWS region to use for ECR"
+        required: false
+        type: string
+        default: "ap-northeast-2"
+      context:
+        description: "(Optional) Docker build context"
+        required: false
+        type: string
+        default: "."
+      dockerfile:
+        description: "(Optional) Dockerfile path"
+        required: false
+        type: string
+        default: "Dockerfile"
+      image_name:
+        description: "Docker image name"
+        required: true
+        type: string
+      image_tags:
+        description: "Additional Docker image tags `docker/metadata-action` format"
+        required: false
+        type: string
+        default: |
+          type=sha,format=short,prefix=
+          type=ref,event=branch
+          type=ref,event=tag
+          type=ref,event=pr
+          type=semver,pattern=v{{version}}
+          type=semver,pattern=v{{major}}.{{minor}}
+          type=semver,pattern=v{{major}}
+      image_flavor:
+        description: "Docker image flavor (optional)"
+        required: false
+        type: string
+        default: |
+          latest=auto
+      buildx_driver:
+        description: "Docker Buildx driver (Optional)"
+        required: false
+        type: string
+        default: docker-container
+      buildx_version:
+        description: "Docker Buildx version (Optional)"
+        required: false
+        type: string
+        default: latest
+      buildx_platforms:
+        description: "Dcoker Buildx platforms (Optional)"
+        required: false
+        type: string
+        default: linux/arm64
+      image_push:
+        description: "Whether to push the Docker image (Optional)"
+        required: false
+        type: boolean
+        default: true
+
+    secrets:
+      oidc_role_arn:
+        required: true
+        description: "ECR OIDC role ARN for AWS authentication"
+
+    outputs:
+      builder_name:
+        description: "Docker Buildx builder name"
+        value: ${{ jobs.docker-push.outputs.builder_name }}
+      builder_driver:
+        description: "Docker Buildx driver"
+        value: ${{ jobs.docker-push.outputs.builder_driver }}
+      buildx_platforms:
+        description: "Docker Buildx platforms"
+        value: ${{ jobs.docker-push.outputs.buildx_platforms }}
+      image_version:
+        description: "Docker image version"
+        value: ${{ jobs.docker-push.outputs.image_version }}
+      image_tags:
+        description: "Docker image tags"
+        value: ${{ jobs.docker-push.outputs.image_tags }}
+      image_labels:
+        description: "Docker image labels"
+        value: ${{ jobs.docker-push.outputs.image_labels }}
+      image_annotations:
+        description: "Docker image annotations"
+        value: ${{ jobs.docker-push.outputs.image_annotations }}
+      image_id:
+        description: "Docker image ID"
+        value: ${{ jobs.docker-push.outputs.image_id }}
+      image_digest:
+        description: "Docker image digest"
+        value: ${{ jobs.docker-push.outputs.image_digest }}
+      image_build_metadata:
+        description: "Docker image build metadata"
+        value: ${{ jobs.docker-push.outputs.image_build_metadata }}
+permissions: {}
+
+jobs:
+  docker-push:
+    permissions:
+      contents: read
+      id-token: write
+    name: Build and Push Docker Image
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        id: setup-buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver: ${{inputs.buildx_driver}}
+          version: ${{inputs.buildx_version}}
+          platforms: ${{inputs.buildx_platforms}}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-region: ${{ inputs.aws_region }}
+          role-to-assume: ${{ secrets.oidc_role_arn }}
+          mask-aws-account-id: true
+          role-session-name: gha-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Prepare Docker image tags
+        id: prepare-tags
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.ecr-login.outputs.registry }}/${{ inputs.image_name }}
+          tags: ${{ inputs.image_tags }}
+          flavor: ${{ inputs.image_flavor }}
+          context: workflow
+
+      - name: Build and Push Docker image
+        id: build-and-push
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          tags: ${{ steps.prepare-tags.outputs.tags }}
+          labels: ${{ steps.prepare-tags.outputs.labels }}
+          annotations: ${{ steps.prepare-tags.outputs.annotations }}
+          platforms: ${{ inputs.buildx_platforms }}
+          push: ${{ inputs.image_push }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+    outputs:
+      builder_name: ${{ steps.setup-buildx.outputs.name }}
+      builder_driver: ${{ steps.setup-buildx.outputs.driver }}
+      buildx_platforms: ${{ steps.setup-buildx.outputs.platforms }}
+      image_version: ${{ steps.prepare-tags.outputs.version }}
+      image_tags: ${{ steps.prepare-tags.outputs.tags }}
+      image_labels: ${{ steps.prepare-tags.outputs.labels }}
+      image_annotations: ${{ steps.prepare-tags.outputs.annotations }}
+      image_id: ${{ steps.build-and-push.outputs.imageid }}
+      image_digest: ${{ steps.build-and-push.outputs.digest }}
+      image_build_metadata: ${{ steps.build-and-push.outputs.metadata }}

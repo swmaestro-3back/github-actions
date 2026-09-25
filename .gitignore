@@ -1,0 +1,12 @@
+# Agent session data
+.omc/
+.claude/
+CLAUDE.md
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# macOS metadata
+.DS_Store
