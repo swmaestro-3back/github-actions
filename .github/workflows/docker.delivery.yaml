@@ -69,6 +69,18 @@ on:
         required: false
         type: boolean
         default: true
+      build_artifact:
+        description: >
+          (Optional) The name of the artifact to download into the build context.
+        required: false
+        type: string
+        default: ""
+      build_artifact_path:
+        description: >
+          (Optional) Full path to extract the artifact.
+        required: false
+        type: string
+        default: "."
 
     secrets:
       oidc_role_arn:
@@ -119,6 +131,13 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+
+      - name: Download build artifact
+        if: inputs.build_artifact != ''
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.build_artifact }}
+          path: ${{ inputs.build_artifact_path }}
 
       - name: Set up Docker Buildx
         id: setup-buildx
