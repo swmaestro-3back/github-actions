@@ -1,0 +1,199 @@
+name: ssm.deploy
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: "Runner label as a JSON string"
+        type: string
+        default: '"ubuntu-24.04-arm"'
+      aws_region:
+        description: "AWS region"
+        type: string
+        default: "ap-northeast-2"
+      instance_id:
+        description: "Target EC2 instance id"
+        type: string
+        required: true
+      compose_dir:
+        description: "Directory on the instance holding docker-compose.yml and .env"
+        type: string
+        required: true
+      compose_file:
+        description: "Compose file name inside compose_dir"
+        type: string
+        default: "docker-compose.yml"
+      service:
+        description: "Compose service to redeploy"
+        type: string
+        required: true
+      image_env_var:
+        description: "Variable in .env that the compose file substitutes for the image"
+        type: string
+        required: true
+      image:
+        description: "Digest-pinned image reference"
+        type: string
+        required: true
+      health_url:
+        description: "URL checked from inside the instance after the deploy. Empty skips the check"
+        type: string
+        default: ""
+      health_retries:
+        description: "Health check attempts, 3s apart"
+        type: number
+        default: 40
+      command_timeout_seconds:
+        description: "How long to wait for the SSM command to finish"
+        type: number
+        default: 600
+    secrets:
+      oidc_role_arn:
+        description: "Role assumed via GitHub OIDC"
+        required: true
+    outputs:
+      command_id:
+        description: "SSM command id"
+        value: ${{ jobs.ssm-deploy.outputs.command_id }}
+
+permissions: {}
+
+jobs:
+  ssm-deploy:
+    permissions:
+      contents: read
+      id-token: write
+
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+
+    outputs:
+      command_id: ${{ steps.send.outputs.command_id }}
+
+    steps:
+      - name: AWS 자격 증명 설정
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.oidc_role_arn }}
+          role-session-name: gha-${{ github.run_id }}-${{ github.run_attempt }}
+          aws-region: ${{ inputs.aws_region }}
+          mask-aws-account-id: true
+
+      - name: 배포 명령 전송
+        id: send
+        env:
+          INSTANCE_ID: ${{ inputs.instance_id }}
+          COMPOSE_DIR: ${{ inputs.compose_dir }}
+          COMPOSE_FILE: ${{ inputs.compose_file }}
+          SERVICE: ${{ inputs.service }}
+          IMAGE_ENV_VAR: ${{ inputs.image_env_var }}
+          IMAGE: ${{ inputs.image }}
+          HEALTH_URL: ${{ inputs.health_url }}
+          HEALTH_RETRIES: ${{ inputs.health_retries }}
+        run: |
+          set -euo pipefail
+
+          if ! printf '%s' "$IMAGE_ENV_VAR" | LC_ALL=C grep -qE '^[A-Z_][A-Z0-9_]*$'; then
+            echo "::error::image_env_var 는 대문자와 숫자, 밑줄만 허용한다: $IMAGE_ENV_VAR"
+            exit 1
+          fi
+          if ! printf '%s' "$IMAGE" | LC_ALL=C grep -qE '^[^[:space:]]+@sha256:[0-9a-f]{64}$'; then
+            echo "::error::image 는 digest 고정 참조여야 한다: $IMAGE"
+            exit 1
+          fi
+
+          remote=$(cat <<EOS
+          set -euo pipefail
+          cd $(printf '%q' "$COMPOSE_DIR")
+
+          touch .env
+          cp .env ".env.bak-\$(date +%Y%m%d-%H%M%S)"
+          grep -v "^$(printf '%s' "$IMAGE_ENV_VAR")=" .env > .env.next || true
+          printf '%s=%s\n' $(printf '%q' "$IMAGE_ENV_VAR") $(printf '%q' "$IMAGE") >> .env.next
+          mv .env.next .env
+          chmod 600 .env
+
+          docker compose -f $(printf '%q' "$COMPOSE_FILE") pull $(printf '%q' "$SERVICE")
+          docker compose -f $(printf '%q' "$COMPOSE_FILE") up -d $(printf '%q' "$SERVICE")
+          docker compose -f $(printf '%q' "$COMPOSE_FILE") ps $(printf '%q' "$SERVICE")
+
+          cid=\$(docker compose -f $(printf '%q' "$COMPOSE_FILE") ps -q $(printf '%q' "$SERVICE"))
+          if [ -z "\$cid" ]; then
+            echo "컨테이너가 실행 중이 아니다"
+            exit 1
+          fi
+          running=\$(docker inspect --format '{{.Config.Image}}' "\$cid")
+          if [ "\$running" != $(printf '%q' "$IMAGE") ]; then
+            echo "실행 중인 이미지가 배포 대상과 다르다"
+            echo "  기대: $(printf '%s' "$IMAGE")"
+            echo "  실제: \$running"
+            exit 1
+          fi
+          echo "이미지 확인: \$running"
+
+          if [ -n $(printf '%q' "$HEALTH_URL") ]; then
+            for i in \$(seq 1 $(printf '%q' "$HEALTH_RETRIES")); do
+              code=\$(curl -s -o /dev/null -w "%{http_code}" $(printf '%q' "$HEALTH_URL") || true)
+              [ "\$code" = "200" ] && { echo "health OK after \$i attempts"; exit 0; }
+              sleep 3
+            done
+            echo "health check failed: $(printf '%q' "$HEALTH_URL")"
+            exit 1
+          fi
+          EOS
+          )
+
+          payload=$(printf '%s' "$remote" | base64 | tr -d '\n')
+
+          command_id=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "gha ${GITHUB_REPOSITORY} run ${GITHUB_RUN_ID}" \
+            --parameters "commands=[\"echo ${payload} | base64 -d | sudo -iu ubuntu bash -s\"]" \
+            --query Command.CommandId --output text)
+
+          echo "command_id=${command_id}" >> "$GITHUB_OUTPUT"
+          echo "SSM CommandId: ${command_id}"
+
+      - name: 결과 대기 및 검증
+        env:
+          INSTANCE_ID: ${{ inputs.instance_id }}
+          COMMAND_ID: ${{ steps.send.outputs.command_id }}
+          COMMAND_TIMEOUT: ${{ inputs.command_timeout_seconds }}
+        run: |
+          set -euo pipefail
+
+          deadline=$(( $(date +%s) + COMMAND_TIMEOUT ))
+          while :; do
+            status=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+              --query Status --output text)
+            case "$status" in
+              Pending|InProgress|Delayed) ;;
+              *) break ;;
+            esac
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::SSM 명령이 ${COMMAND_TIMEOUT}초 안에 끝나지 않았다 (마지막 상태 ${status})"
+              exit 1
+            fi
+            sleep 5
+          done
+
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+            --query '{Status:Status,ResponseCode:ResponseCode}' --output table
+
+          echo "--- stdout ---"
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" --query StandardOutputContent --output text
+          echo "--- stderr ---"
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" --query StandardErrorContent --output text
+
+          code=$(aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+            --query ResponseCode --output text)
+
+          if [ "$status" != "Success" ] || [ "$code" != "0" ]; then
+            echo "::error::배포 실패 (Status ${status}, ResponseCode ${code})"
+            exit 1
+          fi
