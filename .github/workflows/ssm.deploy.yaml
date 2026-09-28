@@ -27,8 +27,12 @@ on:
         description: "Variable in .env that the compose file substitutes for the image"
         type: string
         required: true
-      image:
-        description: "Digest-pinned image reference"
+      image_name:
+        description: "ECR repository name, e.g. finngraph/api-gateway"
+        type: string
+        required: true
+      image_digest:
+        description: "Image digest, sha256:..."
         type: string
         required: true
       health_url:
@@ -85,7 +89,9 @@ jobs:
           COMPOSE_FILE: ${{ inputs.compose_file }}
           SERVICE: ${{ inputs.service }}
           IMAGE_ENV_VAR: ${{ inputs.image_env_var }}
-          IMAGE: ${{ inputs.image }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          AWS_REGION_IN: ${{ inputs.aws_region }}
           HEALTH_URL: ${{ inputs.health_url }}
           HEALTH_RETRIES: ${{ inputs.health_retries }}
         run: |
@@ -95,10 +101,17 @@ jobs:
             echo "::error::image_env_var 는 대문자와 숫자, 밑줄만 허용한다: $IMAGE_ENV_VAR"
             exit 1
           fi
-          if ! printf '%s' "$IMAGE" | LC_ALL=C grep -qE '^[^[:space:]]+@sha256:[0-9a-f]{64}$'; then
-            echo "::error::image 는 digest 고정 참조여야 한다: $IMAGE"
+          if ! printf '%s' "$IMAGE_NAME" | LC_ALL=C grep -qE '^[a-z0-9][a-z0-9._/-]*$'; then
+            echo "::error::image_name 형식이 올바르지 않다: $IMAGE_NAME"
             exit 1
           fi
+          if ! printf '%s' "$IMAGE_DIGEST" | LC_ALL=C grep -qE '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::image_digest 는 sha256:<64자> 형식이어야 한다: $IMAGE_DIGEST"
+            exit 1
+          fi
+
+          account=$(aws sts get-caller-identity --query Account --output text)
+          IMAGE="${account}.dkr.ecr.${AWS_REGION_IN}.amazonaws.com/${IMAGE_NAME}@${IMAGE_DIGEST}"
 
           remote=$(cat <<EOS
           set -euo pipefail
