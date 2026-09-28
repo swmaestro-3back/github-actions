@@ -11,10 +11,6 @@ on:
         description: "AWS region"
         type: string
         default: "ap-northeast-2"
-      instance_id:
-        description: "Target EC2 instance id"
-        type: string
-        required: true
       compose_dir:
         description: "Directory on the instance holding docker-compose.yml and .env"
         type: string
@@ -51,6 +47,9 @@ on:
       oidc_role_arn:
         description: "Role assumed via GitHub OIDC"
         required: true
+      instance_id:
+        description: "Target EC2 instance id"
+        required: true
     outputs:
       command_id:
         description: "SSM command id"
@@ -81,7 +80,7 @@ jobs:
       - name: 배포 명령 전송
         id: send
         env:
-          INSTANCE_ID: ${{ inputs.instance_id }}
+          INSTANCE_ID: ${{ secrets.instance_id }}
           COMPOSE_DIR: ${{ inputs.compose_dir }}
           COMPOSE_FILE: ${{ inputs.compose_file }}
           SERVICE: ${{ inputs.service }}
@@ -156,7 +155,7 @@ jobs:
 
       - name: 결과 대기 및 검증
         env:
-          INSTANCE_ID: ${{ inputs.instance_id }}
+          INSTANCE_ID: ${{ secrets.instance_id }}
           COMMAND_ID: ${{ steps.send.outputs.command_id }}
           COMMAND_TIMEOUT: ${{ inputs.command_timeout_seconds }}
         run: |
