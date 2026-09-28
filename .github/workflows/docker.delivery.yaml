@@ -118,12 +118,6 @@ on:
       image_build_metadata:
         description: "Docker image build metadata"
         value: ${{ jobs.docker-push.outputs.image_build_metadata }}
-      registry:
-        description: "ECR registry host"
-        value: ${{ jobs.docker-push.outputs.registry }}
-      image_ref:
-        description: "Digest-pinned image reference for deployment"
-        value: ${{ jobs.docker-push.outputs.image_ref }}
 permissions: {}
 
 jobs:
@@ -199,5 +193,3 @@ jobs:
       image_id: ${{ steps.build-and-push.outputs.imageid }}
       image_digest: ${{ steps.build-and-push.outputs.digest }}
       image_build_metadata: ${{ steps.build-and-push.outputs.metadata }}
-      registry: ${{ steps.ecr-login.outputs.registry }}
-      image_ref: ${{ steps.ecr-login.outputs.registry }}/${{ inputs.image_name }}@${{ steps.build-and-push.outputs.digest }}
