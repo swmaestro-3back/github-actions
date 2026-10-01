@@ -11,20 +11,52 @@ on:
         description: "AWS region"
         type: string
         default: "ap-northeast-2"
+      run_as:
+        description: "OS user that runs docker compose on the instance"
+        type: string
+        default: "ubuntu"
       compose_dir:
-        description: "Directory on the instance holding docker-compose.yml and .env"
+        description: "Directory on the instance holding the compose file and env files"
         type: string
         required: true
       compose_file:
         description: "Compose file name inside compose_dir"
         type: string
         default: "docker-compose.yml"
+      compose_source:
+        description: "Path of the compose file in the caller repository. When set, it replaces compose_file on the instance. Empty keeps the file already on the instance"
+        type: string
+        default: ""
+      compose_env_file:
+        description: "File in compose_dir used for compose variable substitution. image_env_var is written here"
+        type: string
+        default: ".env"
+      env_ssm_prefix:
+        description: "SSM Parameter Store path rendered into env_file. The last path segment becomes the variable name. Empty skips rendering"
+        type: string
+        default: ""
+      env_file:
+        description: "File in compose_dir written from env_ssm_prefix. It is replaced as a whole, not merged"
+        type: string
+        default: ".env"
+      env_required_keys:
+        description: "Space separated keys that must exist under env_ssm_prefix"
+        type: string
+        default: ""
+      aws_cli_image:
+        description: "Image used to read SSM when the instance has no aws CLI"
+        type: string
+        default: "public.ecr.aws/aws-cli/aws-cli:2.37.7"
       service:
         description: "Compose service to redeploy"
         type: string
         required: true
+      pre_deploy_service:
+        description: "One-off compose service run before the deploy, e.g. a migration. A non-zero exit aborts the deploy"
+        type: string
+        default: ""
       image_env_var:
-        description: "Variable in .env that the compose file substitutes for the image"
+        description: "Variable in compose_env_file that the compose file substitutes for the image"
         type: string
         required: true
       image_name:
@@ -73,6 +105,12 @@ jobs:
       command_id: ${{ steps.send.outputs.command_id }}
 
     steps:
+      - name: 레포 체크아웃
+        if: inputs.compose_source != ''
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: AWS 자격 증명 설정
         uses: aws-actions/configure-aws-credentials@v5
         with:
@@ -85,82 +123,214 @@ jobs:
         id: send
         env:
           INSTANCE_ID: ${{ secrets.instance_id }}
+          AWS_REGION_IN: ${{ inputs.aws_region }}
+          RUN_AS: ${{ inputs.run_as }}
           COMPOSE_DIR: ${{ inputs.compose_dir }}
           COMPOSE_FILE: ${{ inputs.compose_file }}
+          COMPOSE_SOURCE: ${{ inputs.compose_source }}
+          COMPOSE_ENV_FILE: ${{ inputs.compose_env_file }}
+          ENV_SSM_PREFIX: ${{ inputs.env_ssm_prefix }}
+          ENV_FILE: ${{ inputs.env_file }}
+          ENV_REQUIRED_KEYS: ${{ inputs.env_required_keys }}
+          AWS_CLI_IMAGE: ${{ inputs.aws_cli_image }}
           SERVICE: ${{ inputs.service }}
+          PRE_DEPLOY_SERVICE: ${{ inputs.pre_deploy_service }}
           IMAGE_ENV_VAR: ${{ inputs.image_env_var }}
           IMAGE_NAME: ${{ inputs.image_name }}
           IMAGE_DIGEST: ${{ inputs.image_digest }}
-          AWS_REGION_IN: ${{ inputs.aws_region }}
           HEALTH_URL: ${{ inputs.health_url }}
           HEALTH_RETRIES: ${{ inputs.health_retries }}
         run: |
           set -euo pipefail
 
-          if ! printf '%s' "$IMAGE_ENV_VAR" | LC_ALL=C grep -qE '^[A-Z_][A-Z0-9_]*$'; then
-            echo "::error::image_env_var 는 대문자와 숫자, 밑줄만 허용한다: $IMAGE_ENV_VAR"
-            exit 1
-          fi
-          if ! printf '%s' "$IMAGE_NAME" | LC_ALL=C grep -qE '^[a-z0-9][a-z0-9._/-]*$'; then
-            echo "::error::image_name 형식이 올바르지 않다: $IMAGE_NAME"
-            exit 1
-          fi
-          if ! printf '%s' "$IMAGE_DIGEST" | LC_ALL=C grep -qE '^sha256:[0-9a-f]{64}$'; then
-            echo "::error::image_digest 는 sha256:<64자> 형식이어야 한다: $IMAGE_DIGEST"
-            exit 1
+          check() {   # check <이름> <값> <정규식>
+            if ! printf '%s' "$2" | LC_ALL=C grep -qE "$3"; then
+              echo "::error::$1 형식이 올바르지 않다: $2"
+              exit 1
+            fi
+          }
+          check run_as "$RUN_AS" '^[a-z_][a-z0-9_-]*$'
+          check compose_file "$COMPOSE_FILE" '^[A-Za-z0-9._-]+$'
+          check compose_env_file "$COMPOSE_ENV_FILE" '^[A-Za-z0-9._-]+$'
+          check env_file "$ENV_FILE" '^[A-Za-z0-9._-]+$'
+          check service "$SERVICE" '^[A-Za-z0-9._-]+$'
+          check image_env_var "$IMAGE_ENV_VAR" '^[A-Z_][A-Z0-9_]*$'
+          check image_name "$IMAGE_NAME" '^[a-z0-9][a-z0-9._/-]*$'
+          check image_digest "$IMAGE_DIGEST" '^sha256:[0-9a-f]{64}$'
+          [ -z "$PRE_DEPLOY_SERVICE" ] || check pre_deploy_service "$PRE_DEPLOY_SERVICE" '^[A-Za-z0-9._-]+$'
+          [ -z "$ENV_SSM_PREFIX" ] || check env_ssm_prefix "$ENV_SSM_PREFIX" '^/[A-Za-z0-9_./-]+$'
+          [ -z "$ENV_REQUIRED_KEYS" ] || check env_required_keys "$ENV_REQUIRED_KEYS" '^[A-Za-z0-9_ ]+$'
+
+          compose_b64=""
+          if [ -n "$COMPOSE_SOURCE" ]; then
+            case "$COMPOSE_SOURCE" in
+              /*|*..*) echo "::error::compose_source 는 레포 안의 상대 경로여야 한다: $COMPOSE_SOURCE"; exit 1 ;;
+            esac
+            src="$GITHUB_WORKSPACE/$COMPOSE_SOURCE"
+            [ -f "$src" ] || { echo "::error::compose_source 파일이 없다: $COMPOSE_SOURCE"; exit 1; }
+            # SSM 명령 파라미터 크기 한도 안에 들도록 제한한다.
+            [ "$(wc -c < "$src")" -le 32768 ] || { echo "::error::compose_source 가 32KB 를 넘는다"; exit 1; }
+            compose_b64=$(base64 -w0 "$src")
           fi
 
           account=$(aws sts get-caller-identity --query Account --output text)
           IMAGE="${account}.dkr.ecr.${AWS_REGION_IN}.amazonaws.com/${IMAGE_NAME}@${IMAGE_DIGEST}"
 
-          remote=$(cat <<EOS
-          set -euo pipefail
-          cd $(printf '%q' "$COMPOSE_DIR")
-
-          touch .env
-          cp .env ".env.bak-\$(date +%Y%m%d-%H%M%S)"
-          grep -v "^$(printf '%s' "$IMAGE_ENV_VAR")=" .env > .env.next || true
-          printf '%s=%s\n' $(printf '%q' "$IMAGE_ENV_VAR") $(printf '%q' "$IMAGE") >> .env.next
-          mv .env.next .env
-          chmod 600 .env
-
-          docker compose -f $(printf '%q' "$COMPOSE_FILE") pull $(printf '%q' "$SERVICE")
-          docker compose -f $(printf '%q' "$COMPOSE_FILE") up -d $(printf '%q' "$SERVICE")
-          docker compose -f $(printf '%q' "$COMPOSE_FILE") ps $(printf '%q' "$SERVICE")
-
-          cid=\$(docker compose -f $(printf '%q' "$COMPOSE_FILE") ps -q $(printf '%q' "$SERVICE"))
-          if [ -z "\$cid" ]; then
-            echo "컨테이너가 실행 중이 아니다"
-            exit 1
-          fi
-          running=\$(docker inspect --format '{{.Config.Image}}' "\$cid")
-          if [ "\$running" != $(printf '%q' "$IMAGE") ]; then
-            echo "실행 중인 이미지가 배포 대상과 다르다"
-            echo "  기대: $(printf '%s' "$IMAGE")"
-            echo "  실제: \$running"
-            exit 1
-          fi
-          echo "이미지 확인: \$running"
-
-          if [ -n $(printf '%q' "$HEALTH_URL") ]; then
-            for i in \$(seq 1 $(printf '%q' "$HEALTH_RETRIES")); do
-              code=\$(curl -s -o /dev/null -w "%{http_code}" $(printf '%q' "$HEALTH_URL") || true)
-              [ "\$code" = "200" ] && { echo "health OK after \$i attempts"; exit 0; }
-              sleep 3
+          # 값은 맨 앞에서 변수로만 선언하고, 본문은 그대로 보낸다.
+          header=$(
+            for v in COMPOSE_DIR COMPOSE_FILE COMPOSE_ENV_FILE ENV_SSM_PREFIX ENV_FILE ENV_REQUIRED_KEYS \
+                     AWS_CLI_IMAGE SERVICE PRE_DEPLOY_SERVICE IMAGE_ENV_VAR IMAGE HEALTH_URL HEALTH_RETRIES; do
+              printf '%s=%q\n' "$v" "${!v}"
             done
-            echo "health check failed: $(printf '%q' "$HEALTH_URL")"
-            exit 1
-          fi
-          EOS
+            printf 'AWS_REGION=%q\n' "$AWS_REGION_IN"
+            printf 'COMPOSE_B64=%q\n' "$compose_b64"
           )
 
-          payload=$(printf '%s' "$remote" | base64 | tr -d '\n')
+          body=$(cat <<'BODY'
+          set -euo pipefail
+          umask 077
+          cd "$COMPOSE_DIR"
+
+          ts=$(date +%Y%m%d-%H%M%S)
+          backed=()
+          created=()
+
+          compose() { docker compose --env-file "$COMPOSE_ENV_FILE" -f "$COMPOSE_FILE" "$@"; }
+
+          backup() {   # 바꾸기 전에 원본을 남긴다. 없던 파일은 롤백 때 지운다.
+            if [ -f "$1" ]; then
+              cp -p "$1" "$1.bak-$ts"
+              backed+=("$1")
+              ls -1t "$1".bak-* 2>/dev/null | tail -n +6 | xargs -r rm -f --
+            else
+              created+=("$1")
+            fi
+          }
+
+          restore_files() {
+            local f
+            for f in ${backed[@]+"${backed[@]}"}; do cp -p "$f.bak-$ts" "$f"; done
+            for f in ${created[@]+"${created[@]}"}; do rm -f "$f"; done
+          }
+
+          abort() {   # 컨테이너를 바꾸기 전 실패: 파일만 되돌린다
+            echo "배포 중단: $1"
+            restore_files
+            exit 1
+          }
+
+          rollback() {   # 컨테이너를 바꾼 뒤 실패: 파일을 되돌리고 이전 상태로 다시 띄운다
+            echo "배포 실패: $1"
+            restore_files
+            if compose up -d "$SERVICE"; then
+              echo "이전 설정으로 롤백했다"
+            else
+              echo "롤백도 실패했다. 수동 확인 필요"
+            fi
+            exit 1
+          }
+
+          # 1. SSM → env 파일
+          if [ -n "$ENV_SSM_PREFIX" ]; then
+            params=$(mktemp)
+            trap 'rm -f "$params"' EXIT
+            if command -v aws >/dev/null 2>&1; then
+              aws ssm get-parameters-by-path --region "$AWS_REGION" --path "$ENV_SSM_PREFIX" \
+                --recursive --with-decryption --output json > "$params" || abort "SSM 조회 실패"
+            else
+              docker run --rm --network host -e AWS_REGION="$AWS_REGION" "$AWS_CLI_IMAGE" \
+                ssm get-parameters-by-path --region "$AWS_REGION" --path "$ENV_SSM_PREFIX" \
+                --recursive --with-decryption --output json > "$params" || abort "SSM 조회 실패"
+            fi
+
+            backup "$ENV_FILE"
+            python3 - "$params" "$ENV_FILE.next" "$ENV_REQUIRED_KEYS" <<'PY' || abort "env 파일 생성 실패"
+          import json, re, sys
+
+          src, out, required = sys.argv[1], sys.argv[2], sys.argv[3].split()
+          values = {}
+          for p in json.load(open(src)).get("Parameters", []):
+              key = p["Name"].rsplit("/", 1)[-1]
+              if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                  sys.exit(f"변수 이름으로 쓸 수 없는 파라미터: {p['Name']}")
+              if key in values:
+                  sys.exit(f"같은 변수 이름이 두 번 나온다: {key}")
+              # 작은따옴표 안의 값은 compose 가 그대로 읽는다. 작은따옴표가 든 값만 표현할 수 없다.
+              if "'" in p["Value"]:
+                  sys.exit(f"작은따옴표가 든 값은 지원하지 않는다: {key}")
+              values[key] = p["Value"]
+
+          if not values:
+              sys.exit("파라미터가 하나도 없다. 경로를 확인할 것")
+          missing = [k for k in required if k not in values]
+          if missing:
+              sys.exit("없는 필수 키: " + " ".join(missing))
+
+          with open(out, "w") as f:
+              for k in sorted(values):
+                  f.write(f"{k}='{values[k]}'\n")
+          print(f"env 파일 생성: {len(values)}개 키 — " + " ".join(sorted(values)))
+          PY
+            mv "$ENV_FILE.next" "$ENV_FILE"
+          fi
+
+          # 2. 이미지 변수
+          [ "$ENV_FILE" = "$COMPOSE_ENV_FILE" ] && [ -n "$ENV_SSM_PREFIX" ] || backup "$COMPOSE_ENV_FILE"
+          touch "$COMPOSE_ENV_FILE"
+          grep -v "^${IMAGE_ENV_VAR}=" "$COMPOSE_ENV_FILE" > "$COMPOSE_ENV_FILE.next" || true
+          printf '%s=%s\n' "$IMAGE_ENV_VAR" "$IMAGE" >> "$COMPOSE_ENV_FILE.next"
+          mv "$COMPOSE_ENV_FILE.next" "$COMPOSE_ENV_FILE"
+
+          # 3. compose 파일
+          if [ -n "$COMPOSE_B64" ]; then
+            printf '%s' "$COMPOSE_B64" | base64 -d > "$COMPOSE_FILE.next"
+            docker compose --env-file "$COMPOSE_ENV_FILE" -f "$COMPOSE_FILE.next" config -q \
+              || { rm -f "$COMPOSE_FILE.next"; abort "compose 파일 검증 실패"; }
+            backup "$COMPOSE_FILE"
+            mv "$COMPOSE_FILE.next" "$COMPOSE_FILE"
+            echo "compose 파일 교체: $COMPOSE_FILE"
+          else
+            compose config -q || abort "compose 파일 검증 실패"
+          fi
+
+          # 4. 이미지 받기 · 사전 작업
+          compose pull -q "$SERVICE" ${PRE_DEPLOY_SERVICE:+"$PRE_DEPLOY_SERVICE"} || abort "이미지 pull 실패"
+          if [ -n "$PRE_DEPLOY_SERVICE" ]; then
+            compose run --rm --no-deps "$PRE_DEPLOY_SERVICE" || abort "사전 작업 실패: $PRE_DEPLOY_SERVICE"
+          fi
+
+          # 5. 교체 · 검증
+          compose up -d "$SERVICE" || rollback "compose up 실패"
+          compose ps "$SERVICE"
+
+          cid=$(compose ps -q "$SERVICE")
+          [ -n "$cid" ] || rollback "컨테이너가 실행 중이 아니다"
+          running=$(docker inspect --format '{{.Config.Image}}' "$cid")
+          [ "$running" = "$IMAGE" ] || rollback "실행 중인 이미지가 배포 대상과 다르다 (기대 $IMAGE, 실제 $running)"
+          echo "이미지 확인: $running"
+
+          if [ -n "$HEALTH_URL" ]; then
+            for i in $(seq 1 "$HEALTH_RETRIES"); do
+              code=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" || true)
+              if [ "$code" = "200" ]; then
+                echo "health OK after $i attempts"
+                exit 0
+              fi
+              sleep 3
+            done
+            docker logs --tail 30 "$cid" 2>&1 | grep -v -E '^\s+at ' || true
+            rollback "health check 실패: $HEALTH_URL"
+          fi
+          BODY
+          )
+
+          payload=$(printf '%s\n%s\n' "$header" "$body" | base64 -w0)
 
           command_id=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
             --document-name AWS-RunShellScript \
             --comment "gha ${GITHUB_REPOSITORY} run ${GITHUB_RUN_ID}" \
-            --parameters "commands=[\"echo ${payload} | base64 -d | sudo -iu ubuntu bash -s\"]" \
+            --parameters "commands=[\"echo ${payload} | base64 -d | sudo -iu ${RUN_AS} bash -s\"]" \
             --query Command.CommandId --output text)
 
           echo "command_id=${command_id}" >> "$GITHUB_OUTPUT"
