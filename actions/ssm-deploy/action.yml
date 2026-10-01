@@ -1,0 +1,104 @@
+name: ssm-deploy
+description: >
+  SSM Run Command 로 EC2 의 docker compose 서비스를 다이제스트 고정 이미지로 교체한다.
+  레포의 compose 파일 전달, SSM Parameter Store 기반 env 파일 생성, 사전 작업(마이그레이션),
+  실패 시 롤백을 지원한다. AWS 자격 증명은 호출 전에 설정돼 있어야 한다.
+
+inputs:
+  instance_id:
+    description: "Target EC2 instance id"
+    required: true
+  aws_region:
+    description: "AWS region"
+    default: "ap-northeast-2"
+  run_as:
+    description: "OS user that runs docker compose on the instance"
+    default: "ubuntu"
+  compose_dir:
+    description: "Directory on the instance holding the compose file and env files"
+    required: true
+  compose_file:
+    description: "Compose file name inside compose_dir"
+    default: "docker-compose.yml"
+  compose_source:
+    description: "Path of the compose file in the checked-out repository. When set, it replaces compose_file on the instance"
+    default: ""
+  compose_env_file:
+    description: "File in compose_dir used for compose variable substitution. image_env_var is written here"
+    default: ".env"
+  env_ssm_prefix:
+    description: "SSM Parameter Store path rendered into env_file. The last path segment becomes the variable name. Empty skips rendering"
+    default: ""
+  env_file:
+    description: "File in compose_dir written from env_ssm_prefix. It is replaced as a whole, not merged"
+    default: ".env"
+  env_required_keys:
+    description: "Space separated keys that must exist under env_ssm_prefix"
+    default: ""
+  aws_cli_image:
+    description: "Image used to read SSM when the instance has no aws CLI"
+    default: "public.ecr.aws/aws-cli/aws-cli:2.37.7"
+  service:
+    description: "Compose service to redeploy"
+    required: true
+  pre_deploy_service:
+    description: "One-off compose service run before the deploy, e.g. a migration. A non-zero exit aborts the deploy"
+    default: ""
+  image_env_var:
+    description: "Variable in compose_env_file that the compose file substitutes for the image"
+    required: true
+  image_name:
+    description: "ECR repository name, e.g. finngraph/api-gateway"
+    required: true
+  image_digest:
+    description: "Image digest, sha256:..."
+    required: true
+  health_url:
+    description: "URL checked from inside the instance after the deploy. Empty skips the check"
+    default: ""
+  health_retries:
+    description: "Health check attempts, 3s apart"
+    default: "40"
+  command_timeout_seconds:
+    description: "How long to wait for the SSM command to finish"
+    default: "600"
+
+outputs:
+  command_id:
+    description: "SSM command id"
+    value: ${{ steps.send.outputs.command_id }}
+
+runs:
+  using: composite
+  steps:
+    - name: 배포 명령 전송
+      id: send
+      shell: bash
+      run: bash "$GITHUB_ACTION_PATH/send.sh"
+      env:
+        INSTANCE_ID: ${{ inputs.instance_id }}
+        AWS_REGION: ${{ inputs.aws_region }}
+        RUN_AS: ${{ inputs.run_as }}
+        COMPOSE_DIR: ${{ inputs.compose_dir }}
+        COMPOSE_FILE: ${{ inputs.compose_file }}
+        COMPOSE_SOURCE: ${{ inputs.compose_source }}
+        COMPOSE_ENV_FILE: ${{ inputs.compose_env_file }}
+        ENV_SSM_PREFIX: ${{ inputs.env_ssm_prefix }}
+        ENV_FILE: ${{ inputs.env_file }}
+        ENV_REQUIRED_KEYS: ${{ inputs.env_required_keys }}
+        AWS_CLI_IMAGE: ${{ inputs.aws_cli_image }}
+        SERVICE: ${{ inputs.service }}
+        PRE_DEPLOY_SERVICE: ${{ inputs.pre_deploy_service }}
+        IMAGE_ENV_VAR: ${{ inputs.image_env_var }}
+        IMAGE_NAME: ${{ inputs.image_name }}
+        IMAGE_DIGEST: ${{ inputs.image_digest }}
+        HEALTH_URL: ${{ inputs.health_url }}
+        HEALTH_RETRIES: ${{ inputs.health_retries }}
+
+    - name: 결과 대기 및 검증
+      shell: bash
+      run: bash "$GITHUB_ACTION_PATH/wait.sh"
+      env:
+        INSTANCE_ID: ${{ inputs.instance_id }}
+        COMMAND_ID: ${{ steps.send.outputs.command_id }}
+        COMMAND_TIMEOUT: ${{ inputs.command_timeout_seconds }}
