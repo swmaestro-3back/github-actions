@@ -2,6 +2,7 @@
 # 서버에서 실행된다. send.sh 가 맨 앞에 설정값(변수 선언)을 붙여 SSM 으로 보낸다.
 set -euo pipefail
 umask 077
+mkdir -p "$COMPOSE_DIR"
 cd "$COMPOSE_DIR"
 
 ts=$(date +%Y%m%d-%H%M%S)
