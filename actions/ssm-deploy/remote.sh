@@ -50,7 +50,7 @@ if [ -n "$ENV_SSM_PREFIX" ]; then
   trap 'rm -f "$params"' EXIT
   if command -v aws >/dev/null 2>&1; then
     aws ssm get-parameters-by-path --region "$AWS_REGION" --path "$ENV_SSM_PREFIX" \
-      --recursive --with-decryption --output json > "$params" || abort "SSM 조회 실패"
+      --recursive --with-decryption --output json | cat > "$params" || abort "SSM 조회 실패"
   else
     docker run --rm --network host -e AWS_REGION="$AWS_REGION" "$AWS_CLI_IMAGE" \
       ssm get-parameters-by-path --region "$AWS_REGION" --path "$ENV_SSM_PREFIX" \
