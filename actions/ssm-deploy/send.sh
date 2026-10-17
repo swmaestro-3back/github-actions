@@ -12,13 +12,24 @@ check run_as "$RUN_AS" '^[a-z_][a-z0-9_-]*$'
 check compose_file "$COMPOSE_FILE" '^[A-Za-z0-9._-]+$'
 check compose_env_file "$COMPOSE_ENV_FILE" '^[A-Za-z0-9._-]+$'
 check env_file "$ENV_FILE" '^[A-Za-z0-9._-]+$'
-check service "$SERVICE" '^[A-Za-z0-9._-]+$'
+check service "$SERVICE" '^[A-Za-z0-9._-]+( [A-Za-z0-9._-]+)*$'
 check image_env_var "$IMAGE_ENV_VAR" '^[A-Z_][A-Z0-9_]*$'
 check image_name "$IMAGE_NAME" '^[a-z0-9][a-z0-9._/-]*$'
 check image_digest "$IMAGE_DIGEST" '^sha256:[0-9a-f]{64}$'
-[ -z "$PRE_DEPLOY_SERVICE" ] || check pre_deploy_service "$PRE_DEPLOY_SERVICE" '^[A-Za-z0-9._-]+$'
+[ -z "$PRE_DEPLOY_SERVICE" ] || check pre_deploy_service "$PRE_DEPLOY_SERVICE" '^[A-Za-z0-9._-]+( [A-Za-z0-9._-]+)*$'
 [ -z "$ENV_SSM_PREFIX" ] || check env_ssm_prefix "$ENV_SSM_PREFIX" '^/[A-Za-z0-9_./-]+$'
 [ -z "$ENV_REQUIRED_KEYS" ] || check env_required_keys "$ENV_REQUIRED_KEYS" '^[A-Za-z0-9_ ]+$'
+for entry in $EXTRA_ENV; do
+  check extra_env "$entry" '^[A-Za-z0-9._-]+=/[A-Za-z0-9_./-]+$'
+  file=${entry%%=*}
+  if [ "$file" = "$COMPOSE_ENV_FILE" ] || { [ -n "$ENV_SSM_PREFIX" ] && [ "$file" = "$ENV_FILE" ]; }; then
+    echo "::error::extra_env 파일은 compose_env_file·env_file 과 달라야 한다: $file"
+    exit 1
+  fi
+done
+for entry in $EXTRA_IMAGES; do
+  check extra_images "$entry" '^[A-Z_][A-Z0-9_]*=[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$'
+done
 
 # COMPOSE_B64·IMAGE 는 아래 ${!v} 간접 참조로 원격 스크립트에 넘어간다.
 # shellcheck disable=SC2034
@@ -38,12 +49,16 @@ fi
 account=$(aws sts get-caller-identity --query Account --output text)
 # shellcheck disable=SC2034
 IMAGE="${account}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_NAME}@${IMAGE_DIGEST}"
+EXTRA_IMAGE_REFS=""
+for entry in $EXTRA_IMAGES; do
+  EXTRA_IMAGE_REFS+="${entry%%=*}=${account}.dkr.ecr.${AWS_REGION}.amazonaws.com/${entry#*=} "
+done
 
 payload=$(
   {
     for v in COMPOSE_DIR COMPOSE_FILE COMPOSE_ENV_FILE COMPOSE_B64 ENV_SSM_PREFIX ENV_FILE \
-             ENV_REQUIRED_KEYS AWS_CLI_IMAGE AWS_REGION SERVICE PRE_DEPLOY_SERVICE \
-             IMAGE_ENV_VAR IMAGE HEALTH_URL HEALTH_RETRIES; do
+             ENV_REQUIRED_KEYS EXTRA_ENV AWS_CLI_IMAGE AWS_REGION SERVICE PRE_DEPLOY_SERVICE \
+             IMAGE_ENV_VAR IMAGE EXTRA_IMAGE_REFS HEALTH_URL HEALTH_RETRIES; do
       printf '%s=%q\n' "$v" "${!v}"
     done
     cat "$(dirname "$0")/remote.sh"
