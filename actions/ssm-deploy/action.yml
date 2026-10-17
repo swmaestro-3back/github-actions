@@ -35,14 +35,17 @@ inputs:
   env_required_keys:
     description: "Space separated keys that must exist under env_ssm_prefix"
     default: ""
+  extra_env:
+    description: "Space separated FILE=/ssm/prefix pairs rendered like env_ssm_prefix, for services that need a separate env file"
+    default: ""
   aws_cli_image:
     description: "Image used to read SSM when the instance has no aws CLI"
     default: "public.ecr.aws/aws-cli/aws-cli:2.37.7"
   service:
-    description: "Compose service to redeploy"
+    description: "Space separated compose services to redeploy. Each must run image_env_var's image or one of extra_images"
     required: true
   pre_deploy_service:
-    description: "One-off compose service run before the deploy, e.g. a migration. A non-zero exit aborts the deploy"
+    description: "Space separated one-off compose services run in order before the deploy, e.g. migrations. A non-zero exit aborts the deploy"
     default: ""
   image_env_var:
     description: "Variable in compose_env_file that the compose file substitutes for the image"
@@ -53,6 +56,9 @@ inputs:
   image_digest:
     description: "Image digest, sha256:..."
     required: true
+  extra_images:
+    description: "Space separated VAR=repository@sha256:... entries written to compose_env_file next to image_env_var"
+    default: ""
   health_url:
     description: "URL checked from inside the instance after the deploy. Empty skips the check"
     default: ""
@@ -86,12 +92,14 @@ runs:
         ENV_SSM_PREFIX: ${{ inputs.env_ssm_prefix }}
         ENV_FILE: ${{ inputs.env_file }}
         ENV_REQUIRED_KEYS: ${{ inputs.env_required_keys }}
+        EXTRA_ENV: ${{ inputs.extra_env }}
         AWS_CLI_IMAGE: ${{ inputs.aws_cli_image }}
         SERVICE: ${{ inputs.service }}
         PRE_DEPLOY_SERVICE: ${{ inputs.pre_deploy_service }}
         IMAGE_ENV_VAR: ${{ inputs.image_env_var }}
         IMAGE_NAME: ${{ inputs.image_name }}
         IMAGE_DIGEST: ${{ inputs.image_digest }}
+        EXTRA_IMAGES: ${{ inputs.extra_images }}
         HEALTH_URL: ${{ inputs.health_url }}
         HEALTH_RETRIES: ${{ inputs.health_retries }}
 
