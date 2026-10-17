@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # 서버에서 실행된다. send.sh 가 맨 앞에 설정값(변수 선언)을 붙여 SSM 으로 보낸다.
+{
 set -euo pipefail
 umask 077
 mkdir -p "$COMPOSE_DIR"
@@ -125,7 +126,7 @@ fi
 # 4. 이미지 받기 · 사전 작업
 compose pull -q "${services[@]}" ${pre_deploy[@]+"${pre_deploy[@]}"} || abort "이미지 pull 실패"
 for svc in ${pre_deploy[@]+"${pre_deploy[@]}"}; do
-  compose run --rm --no-deps "$svc" || abort "사전 작업 실패: $svc"
+  compose run --rm --no-deps -T "$svc" < /dev/null || abort "사전 작업 실패: $svc"
 done
 
 # 5. 교체 · 검증
@@ -156,3 +157,4 @@ if [ -n "$HEALTH_URL" ]; then
   docker logs --tail 30 "$cid" 2>&1 | grep -v -E '^\s+at ' || true
   rollback "health check 실패: $HEALTH_URL"
 fi
+}
